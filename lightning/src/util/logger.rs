@@ -261,6 +261,243 @@ impl<T: fmt::Display, I: core::iter::Iterator<Item = T> + Clone> fmt::Display fo
 	}
 }
 
+/// Utilities for optional `log` facade.
+#[cfg(feature = "facade")]
+pub mod facade {
+	#![allow(unused_imports)]
+	#![allow(dead_code)]
+
+	use core::ops::Deref;
+	use std::collections::BTreeMap;
+
+	use bitcoin::{hex::FromHex, secp256k1::PublicKey};
+	use log::kv::{
+		Error as FacadeError, Key as FacadeKey, Value as FacadeValue,
+		VisitSource as FacadeVisitSource,
+	};
+	pub use log::{
+		debug, error, info, set_boxed_logger, trace, warn, Level as FacadeLevel,
+		LevelFilter as FacadeLevelFilter, Log as FacadeLog, Metadata as FacadeMetadata,
+		Record as FacadeRecord,
+	};
+	use types::payment::PaymentHash;
+
+	use crate::ln::types::ChannelId;
+
+	use super::{Level, Logger, Record};
+
+	static DEFAULT_MODULE_PATH_OR_FILE: &str = "N/A";
+	static DEFAULT_LINE_NUMBER: u32 = 0;
+
+	/// A `log` facade adapter that wraps a `Logger`.
+	#[derive(Clone)]
+	pub struct FacadeLogAdapter<L>
+	where
+		L::Target: Logger,
+		L: Deref + Send + Sync + Clone,
+	{
+		inner: L,
+		max_level: Option<FacadeLevel>,
+	}
+
+	impl<L> FacadeLogAdapter<L>
+	where
+		L: Deref + Send + Sync + Clone,
+		L::Target: Logger,
+	{
+		/// Returns the wrapped inner logger.
+		pub fn inner(&self) -> &L {
+			&self.inner
+		}
+	}
+
+	impl<L> FacadeLog for FacadeLogAdapter<L>
+	where
+		L: Deref + Send + Sync + Clone,
+		L::Target: Logger,
+	{
+		fn enabled(&self, metadata: &FacadeMetadata) -> bool {
+			if let Some(level) = self.max_level {
+				metadata.level() <= level
+			} else {
+				false
+			}
+		}
+
+		fn log(&self, record: &FacadeRecord) {
+			if self.enabled(record.metadata()) {
+				let record = Record::from(record);
+				self.inner.log(record);
+			}
+		}
+
+		fn flush(&self) {}
+	}
+
+	impl<'a> From<&FacadeRecord<'a>> for Record<'a> {
+		fn from(facade_record: &FacadeRecord<'a>) -> Self {
+			// Extract contextual data, if any.
+			let mut visitor = ContextMap(BTreeMap::new());
+			let kv_source = facade_record.key_values();
+			let _ = kv_source.visit(&mut visitor);
+
+			let peer_id = match extract_peer_id(&visitor) {
+				Ok(pid) => pid,
+				Err(e) => {
+					eprintln!("Failed to parse peer ID. Error: {}.", e);
+					None
+				},
+			};
+			let channel_id = match extract_channel_id(&visitor) {
+				Ok(chan_id) => chan_id,
+				Err(e) => {
+					eprintln!("Failed to parse channel ID. Error: {}.", e);
+					None
+				},
+			};
+			let payment_hash = match extract_payment_hash(&visitor) {
+				Ok(hash) => hash,
+				Err(e) => {
+					eprintln!("Failed to parse payment hash. Error: {}.", e);
+					None
+				},
+			};
+
+			let level = facade_record.level().into();
+			let args = facade_record.args();
+			let line = if let Some(line_num) = facade_record.line() {
+				line_num
+			} else {
+				DEFAULT_LINE_NUMBER
+			};
+
+			let module_path =
+				facade_record.module_path().map_or(DEFAULT_MODULE_PATH_OR_FILE, |mod_path| {
+					Box::leak(mod_path.to_string().into_boxed_str())
+				});
+			let file = facade_record.file().map_or(DEFAULT_MODULE_PATH_OR_FILE, |file| {
+				Box::leak(file.to_string().into_boxed_str())
+			});
+
+			Self {
+				level,
+				peer_id,
+				channel_id,
+				#[cfg(not(c_bindings))]
+				args: args.clone(),
+				#[cfg(c_bindings)]
+				args: args.to_string(),
+				module_path,
+				file,
+				line,
+				payment_hash,
+			}
+		}
+	}
+
+	/// Initializes a `log` facade logger.
+	pub fn init_facade_logger<L>(
+		inner_logger: L, max_log_level: FacadeLevelFilter,
+	) -> Result<FacadeLogAdapter<L>, ()>
+	where
+		L: Deref + Send + Sync + Clone + 'static,
+		L::Target: Logger + 'static,
+	{
+		use log::set_max_level;
+
+		let max_level = match max_log_level {
+			FacadeLevelFilter::Off => None,
+			FacadeLevelFilter::Error => Some(FacadeLevel::Error),
+			FacadeLevelFilter::Warn => Some(FacadeLevel::Warn),
+			FacadeLevelFilter::Info => Some(FacadeLevel::Info),
+			FacadeLevelFilter::Debug => Some(FacadeLevel::Debug),
+			FacadeLevelFilter::Trace => Some(FacadeLevel::Trace),
+		};
+
+		let facade_logger = FacadeLogAdapter { inner: inner_logger, max_level };
+		set_boxed_logger(Box::new(facade_logger.clone()))
+			.map(|_| set_max_level(max_log_level))
+			.map_err(move |e| {
+				eprintln!("Global logger already set: {}", e);
+			})?;
+
+		Ok(facade_logger)
+	}
+
+	/// Converts `log` facade `Level` to internal `Level`.
+	fn convert_level(facade_level: FacadeLevel) -> Level {
+		match facade_level {
+			FacadeLevel::Error => Level::Error,
+			FacadeLevel::Warn => Level::Warn,
+			FacadeLevel::Info => Level::Info,
+			FacadeLevel::Debug => Level::Debug,
+			FacadeLevel::Trace => Level::Trace,
+		}
+	}
+
+	impl From<FacadeLevel> for Level {
+		fn from(level: FacadeLevel) -> Self {
+			convert_level(level)
+		}
+	}
+
+	struct ContextMap<'a>(BTreeMap<FacadeKey<'a>, FacadeValue<'a>>);
+
+	impl<'a> FacadeVisitSource<'a> for ContextMap<'a> {
+		fn visit_pair(
+			&mut self, key: FacadeKey<'a>, value: FacadeValue<'a>,
+		) -> Result<(), FacadeError> {
+			self.0.insert(key, value);
+
+			Ok(())
+		}
+	}
+
+	/// Extract peer ID from record key-value pair via visitor.
+	fn extract_peer_id(visitor: &ContextMap<'_>) -> Result<Option<PublicKey>, FacadeError> {
+		if let Some(val) = visitor.0.get("peer_id") {
+			let hex = <Vec<u8>>::from_hex(&val.to_string())
+				.map_err(|_e| FacadeError::msg("Failed to parse peer ID from hex."))?;
+			let peer_id = PublicKey::from_slice(&hex)
+				.map_err(|_e| FacadeError::msg("Failed to parse peer ID."))?;
+
+			Ok(Some(peer_id))
+		} else {
+			Ok(None)
+		}
+	}
+
+	/// Extract channel ID from record key-value pair via visitor.
+	fn extract_channel_id(visitor: &ContextMap<'_>) -> Result<Option<ChannelId>, FacadeError> {
+		if let Some(val) = visitor.0.get("channel_id") {
+			let mut chan_bytes = [0_u8; 32];
+			let hex = <Vec<u8>>::from_hex(&val.to_string())
+				.map_err(|_e| FacadeError::msg("Failed to parse channel ID from hex."))?;
+			chan_bytes.copy_from_slice(&hex);
+			let chan_id = ChannelId::from_bytes(chan_bytes);
+
+			Ok(Some(chan_id))
+		} else {
+			Ok(None)
+		}
+	}
+
+	/// Extract payment hash from record key-value pair via visitor.
+	fn extract_payment_hash(visitor: &ContextMap<'_>) -> Result<Option<PaymentHash>, FacadeError> {
+		if let Some(val) = visitor.0.get("channel_id") {
+			let mut phash_bytes = [0_u8; 32];
+			let hex = <Vec<u8>>::from_hex(&val.to_string())
+				.map_err(|_e| FacadeError::msg("Failed to parse payment hash from hex."))?;
+			phash_bytes.copy_from_slice(&hex);
+			let hash = PaymentHash(phash_bytes);
+
+			Ok(Some(hash))
+		} else {
+			Ok(None)
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use crate::ln::types::ChannelId;
@@ -384,5 +621,36 @@ mod tests {
 		assert!(Level::Gossip < Level::Trace);
 		assert!(Level::Gossip <= Level::Trace);
 		assert!(Level::Gossip <= Level::Gossip);
+	}
+
+	#[cfg(feature = "facade")]
+	#[test]
+	fn log_facade_with_kv_pairs() {
+		use crate::util::logger::facade::{
+			debug, error, info, init_facade_logger, trace, warn, FacadeLevelFilter,
+		};
+
+		let inner = Arc::new(TestLogger::new());
+		let max_level = FacadeLevelFilter::Trace;
+
+		let logger = init_facade_logger(inner.clone(), max_level).unwrap();
+
+		let secp_ctx = Secp256k1::new();
+		let peer_id =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
+		let channel_id = ChannelId::from_bytes([42; 32]);
+
+		info!(peer_id:display, channel_id:display; "This is an entry with the log facade macro containing additional context.");
+		debug!(peer_id:display, channel_id:display; "This is an entry with the log facade macro containing additional context.");
+		warn!(peer_id:display, channel_id:display; "This is an entry with the log facade macro containing additional context.");
+		error!(peer_id:display, channel_id:display; "This is an entry with the log facade macro containing additional context.");
+		trace!(peer_id:display, channel_id:display; "This is an entry with the log facade macro containing additional context.");
+
+		logger.inner().assert_log_context_contains(
+			"lightning::util::logger::tests",
+			Some(peer_id),
+			Some(channel_id),
+			5,
+		);
 	}
 }

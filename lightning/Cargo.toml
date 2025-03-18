@@ -32,6 +32,8 @@ grind_signatures = []
 
 default = ["std", "grind_signatures"]
 
+facade = ["log"]
+
 [dependencies]
 lightning-types = { version = "0.3.0", path = "../lightning-types", default-features = false }
 lightning-invoice = { version = "0.34.0", path = "../lightning-invoice", default-features = false }
@@ -49,6 +51,7 @@ backtrace = { version = "0.3", optional = true }
 
 libm = { version = "0.2", default-features = false }
 inventory = { version = "0.3", optional = true  }
+log = { version = "*", optional = true, default-features = false, features = ["kv", "std"] }
 
 [dev-dependencies]
 regex = "1.5.6"
